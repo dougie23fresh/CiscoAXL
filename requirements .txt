@@ -1,2 +1,2 @@
-zeep
 requests
+xmltodict
