@@ -1,299 +1,529 @@
-__author__ = 'Melvin Douglas'
-__version__ = '14'
-__email__ = 'melvin.douglas@hotmail.com'
-__status__ = 'Production'
+import json
+import xmltodict
+from soap import SOAP
 
-import os
-from zeep import Client
-from zeep.cache import SqliteCache
-from zeep.transports import Transport
-from zeep.plugins import HistoryPlugin
-from zeep.exceptions import Fault
-from zeep.helpers import serialize_object
-from requests import Session
-from requests.auth import HTTPBasicAuth
-import urllib3
-from dataclasses import dataclass
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-urllib3.util.ssl_.DEFAULT_CIPHERS = 'HIGH:!DH:!aNULL' #= 'ALL'
+class AXL(SOAP):
+    """
+    The CUCM AXL class
 
-class axl:
-    def __init__(self, username, password, server_ip, server_ver=11.5, tls_verify=True, timeout=10):
-        self.last_exception = None
+    https://developer.cisco.com/docs/axl/
 
-        wsdl = 'file://' + os.path.join(os.getcwd(), f'schema/{server_ver}/AXLAPI.wsdl')
-        address = f'https://{server_ip}:8443/axl/'
-        binding = '{http://www.cisco.com/AXLAPIService/}AXLAPIBinding'
+    :param host: The Hostname / IP Address of the server
+    :type host: String
+    :returns: return an AXL object
+    :rtype: AXL
+    """
 
-        session = Session()
-        session.verify = tls_verify
-        session.auth = HTTPBasicAuth(username, password)
+    def __init__(self, host, username, password, version=11.5, tls_verify=True, timeout=30):
+        # Setup Variables
+        self.host = host
+        self.version = version
+        self.timeout = timeout
+        self.attempts = 0
+        self.max_retries = 3
+        self.backoff_times = [1, 5, 10]
+        self.logging = False
+        self.url = f'https://{self.host}:8443/axl/'
+        super().__init__(self.url, username, password, tls_verify=tls_verify, timeout=timeout)
 
-        cache = SqliteCache()
-        transport = Transport(cache=cache, session=session, timeout=timeout, operation_timeout=timeout)
-        self.history = HistoryPlugin()
-        self.client = Client(wsdl=wsdl, transport=transport, plugins=[self.history])
+    def _soapRequest(self, soap_action, data):
+        soaprequest = {
+            'soap-env:Envelope': {
+                '@xmlns:soap-env': 'http://schemas.xmlsoap.org/soap/envelope/',
+                'soap-env:Body': {f'ns0:{soap_action}': {'@xmlns:ns0': f'http://www.cisco.com/AXL/API/{self.version}'}},
+            }
+        }
+        soaprequest.get('soap-env:Envelope').get('soap-env:Body').get(f'ns0:{soap_action}').update(data)
+        return soaprequest
 
-        self.service = self.client.create_service(binding, address)
+    def _soapResponse(self, response, soap_action):
+        if response['success']:
+            result = xmltodict.parse(response['response'].content, xml_attribs=False)
+            result = json.loads(json.dumps(result))
+            if result.get('soapenv:Envelope').get('soapenv:Body').get('soapenv:Fault'):
+                last_exception = result.get('soapenv:Envelope').get('soapenv:Body').get('soapenv:Fault')
+                return {'success': False, 'response': last_exception}
+            result = result.get('soapenv:Envelope').get('soapenv:Body').get(f'ns:{soap_action}Response')
+            result = result.get('return', {}) if result.get('return', {}) is not None else {}
+            return {'success': True, 'response': result}
+        else:
+            return response
 
-        # region System
-        ## LDAP/Enterprise Parameters/Service Parameters/Licensing
-        # ProcessNode
-        class _ProcessNode: pass
-        self.ProcessNode = _ProcessNode
-        self.ProcessNode.Create = lambda data, serialize=False: self._callSoap_func('addProcessNode', data, serialize)
-        self.ProcessNode.Get = lambda data, serialize=False: self._callSoap_func('getProcessNode', data, serialize)
-        self.ProcessNode.List = lambda data, serialize=False: self._callSoap_func('listProcessNode', data, serialize)
-        self.ProcessNode.Update = lambda data, serialize=False: self._callSoap_func('updateProcessNode', data, serialize)
-        self.ProcessNode.Remove = lambda data, serialize=False: self._callSoap_func('removeProcessNode', data, serialize)
-        # CallManager
-        class _CallManager: pass
-        self.CallManager = _CallManager
-        self.CallManager.Get = lambda data, serialize=False: self._callSoap_func('getCallManager', data, serialize)
-        self.CallManager.List = lambda data, serialize=False: self._callSoap_func('listCallManager', data, serialize)
-        self.CallManager.Update = lambda data, serialize=False: self._callSoap_func('updateCallManager', data, serialize)
-        # CallManagerGroup
-        class _CallManagerGroup: pass
-        self.CallManagerGroup = _CallManagerGroup
-        self.CallManagerGroup.Create = lambda data, serialize=False: self._callSoap_func('addCallManagerGroup', data, serialize)
-        self.CallManagerGroup.Get = lambda data, serialize=False: self._callSoap_func('getCallManagerGroup', data, serialize)
-        self.CallManagerGroup.List = lambda data, serialize=False: self._callSoap_func('listCallManagerGroup', data, serialize)
-        self.CallManagerGroup.Update = lambda data, serialize=False: self._callSoap_func('updateCallManagerGroup', data, serialize)
-        self.CallManagerGroup.Remove = lambda data, serialize=False: self._callSoap_func('removeCallManagerGroup', data, serialize)
-        # PhoneNtp
-        class _PhoneNtp: pass
-        self.PhoneNtp = _PhoneNtp
-        self.PhoneNtp.Create = lambda data, serialize=False: self._callSoap_func('addPhoneNtp', data, serialize)
-        self.PhoneNtp.Get = lambda data, serialize=False: self._callSoap_func('getPhoneNtp', data, serialize)
-        self.PhoneNtp.List = lambda data, serialize=False: self._callSoap_func('listPhoneNtp', data, serialize)
-        self.PhoneNtp.Update = lambda data, serialize=False: self._callSoap_func('updatePhoneNtp', data, serialize)
-        self.PhoneNtp.Remove = lambda data, serialize=False: self._callSoap_func('removePhoneNtp', data, serialize)
+    def request(self, soap_action, data):
+        data = self._soapRequest(soap_action, data)
+        payload = xmltodict.unparse(data)
+        headers = {
+            'Content_type': 'text/xml; charset=utf-8',
+            'SOAPAction': f'"CUCM:DB ver={self.version} {soap_action}"',
+        }
+        response = self._send_request(self.url, headers=headers, payload=payload, http_method='POST')
+        response_data = self._soapResponse(response, soap_action)
+        return response_data
 
-        # DateTimeGroup
+    # region Phones
 
-        # PresenceGroup
+    def add_phone(self, phone_data=None):
+        axl_result = self.request('addPhone', phone_data)
+        return axl_result
 
-        # Region
-        class _Region: pass
-        self.Region = _Region
-        self.Region.Create = lambda data, serialize=False: self._callSoap_func('addRegion', data, serialize)
-        self.Region.Get = lambda data, serialize=False: self._callSoap_func('getRegion', data, serialize)
-        self.Region.List = lambda data, serialize=False: self._callSoap_func('listRegion', data, serialize)
-        self.Region.Update = lambda data, serialize=False: self._callSoap_func('updateRegion', data, serialize)
-        self.Region.Remove = lambda data, serialize=False: self._callSoap_func('removeRegion', data, serialize)
+    def get_phone(self, name=None):
+        data = {'name': name}
+        axl_result = self.request('getPhone', data)
+        return axl_result
 
-        # DevicePool
-        class _DevicePool: pass
-        self.DevicePool = _DevicePool
-        self.DevicePool.Create = lambda data, serialize=False: self._callSoap_func('addDevicePool', data, serialize)
-        self.DevicePool.Get = lambda data, serialize=False: self._callSoap_func('getDevicePool', data, serialize)
-        self.DevicePool.List = lambda data, serialize=False: self._callSoap_func('listDevicePool', data, serialize)
-        self.DevicePool.Update = lambda data, serialize=False: self._callSoap_func('updateDevicePool', data, serialize)
-        self.DevicePool.Remove = lambda data, serialize=False: self._callSoap_func('removeDevicePool', data, serialize)
-        # Location
-        class _Location: pass
-        self.Location = _Location
-        self.Location.Create = lambda data, serialize=False: self._callSoap_func('addLocation', data, serialize)
-        self.Location.Get = lambda data, serialize=False: self._callSoap_func('getLocation', data, serialize)
-        self.Location.List = lambda data, serialize=False: self._callSoap_func('listLocation', data, serialize)
-        self.Location.Update = lambda data, serialize=False: self._callSoap_func('updateLocation', data, serialize)
-        self.Location.Remove = lambda data, serialize=False: self._callSoap_func('removeLocation', data, serialize)
+    def delete_phone(self, name=None):
+        data = {'name': name}
+        axl_result = self.request('removePhone', data)
+        return axl_result
 
-        # PhysicalLocation
+    def apply_phone(self, name=None):
+        data = {'name': name}
+        axl_result = self.request('applyPhone', data)
+        return axl_result
 
-        # Srst
+    def list_phone(self, search_criteria_data=None, returned_tags=None):
+        returned_tags = {
+            'AllowPresentationSharingUsingBfcp': '',
+            'aarNeighborhoodName': '',
+            'allowCtiControlFlag': '',
+            'allowMraMode': '',
+            'allowiXApplicableMedia': '',
+            'alwaysUsePrimeLine': '',
+            'alwaysUsePrimeLineForVoiceMessage': '',
+            'authenticationMode': '',
+            'authenticationString': '',
+            'authenticationUrl': '',
+            'automatedAlternateRoutingCssName': '',
+            'blockIncomingCallsWhenRoaming': '',
+            'builtInBridgeStatus': '',
+            'callInfoPrivacyStatus': '',
+            'callingSearchSpaceName': '',
+            'certificateOperation': '',
+            'certificateStatus': '',
+            'cgpnTransformationCssName': '',
+            'class': '',
+            'commonDeviceConfigName': '',
+            'commonPhoneConfigName': '',
+            'confidentialAccess': '',
+            'currentConfig': '',
+            'currentProfileName': '',
+            'defaultProfileName': '',
+            'description': '',
+            'deviceMobilityMode': '',
+            'devicePoolName': '',
+            'deviceTrustMode': '',
+            'dialRulesName': '',
+            'digestUser': '',
+            'directoryUrl': '',
+            'dndOption': '',
+            'dndRingSetting': '',
+            'dndStatus': '',
+            'earlyOfferSupportForVoiceCall': '',
+            'ecKeySize': '',
+            'enableActivationID': '',
+            'enableCallRoutingToRdWhenNoneIsActive': '',
+            'enableExtensionMobility': '',
+            'featureControlPolicy': '',
+            'geoLocationFilterName': '',
+            'geoLocationName': '',
+            'hlogStatus': '',
+            'homeNetworkId': '',
+            'hotlineDevice': '',
+            'idleTimeout': '',
+            'idleUrl': '',
+            'ignorePresentationIndicators': '',
+            'informationUrl': '',
+            'isActive': '',
+            'isDualMode': '',
+            'isProtected': '',
+            'joinAcrossLines': '',
+            'keyOrder': '',
+            'keySize': '',
+            'loadInformation': '',
+            'locationName': '',
+            'loginDuration': '',
+            'loginTime': '',
+            'loginUserId': '',
+            'mediaResourceListName': '',
+            'messagesUrl': '',
+            'mlppIndicationStatus': '',
+            'mobilityUserIdName': '',
+            'model': '',
+            'mraServiceDomain': '',
+            'mtpPreferedCodec': '',
+            'mtpRequired': '',
+            'name': '',
+            'networkHoldMohAudioSourceId': '',
+            'networkLocale': '',
+            'networkLocation': '',
+            'numberOfButtons': '',
+            'outboundCallRollover': '',
+            'ownerUserName': '',
+            'packetCaptureDuration': '',
+            'packetCaptureMode': '',
+            'phoneServiceDisplay': '',
+            'phoneSuite': '',
+            'phoneTemplateName': '',
+            'preemption': '',
+            'presenceGroupName': '',
+            'primaryPhoneName': '',
+            'product': '',
+            'protocol': '',
+            'protocolSide': '',
+            'proxyServerUrl': '',
+            'remoteDevice': '',
+            'requireDtmfReception': '',
+            'requireOffPremiseLocation': '',
+            'requireThirdPartyRegistration': '',
+            'rerouteCallingSearchSpaceName': '',
+            'retryVideoCallAsAudio': '',
+            'rfc2833Disabled': '',
+            'ringSettingBusyBlfAudibleAlert': '',
+            'ringSettingIdleBlfAudibleAlert': '',
+            'roamingDevicePoolName': '',
+            'secureAuthenticationUrl': '',
+            'secureDirectoryUrl': '',
+            'secureIdleUrl': '',
+            'secureInformationUrl': '',
+            'secureMessageUrl': '',
+            'secureServicesUrl': '',
+            'securityProfileName': '',
+            'sendGeoLocation': '',
+            'servicesUrl': '',
+            'singleButtonBarge': '',
+            'sipProfileName': '',
+            'softkeyTemplateName': '',
+            'sshUserId': '',
+            'subscribeCallingSearchSpaceName': '',
+            'traceFlag': '',
+            'unattendedPort': '',
+            'upgradeFinishTime': '',
+            'useDevicePoolCgpnTransformCss': '',
+            'useTrustedRelayPoint': '',
+            'userHoldMohAudioSourceId': '',
+            'userLocale': '',
+        }
+        data = {'searchCriteria': search_criteria_data, 'returnedTags': returned_tags}
+        axl_result = self.request('listPhone', data)
+        return axl_result
 
-        # Enterprise Parameter
-        # ServiceParameter
+    def update_phone(self, phone_data=None):
+        axl_result = self.request('updatePhone', phone_data)
+        return axl_result
 
-        # GeoLocation
+    # endregion
 
-        # PhoneSecurityProfile
+    # region CallManagerGroup
 
-        # SipTrunkSecurityProfile
+    def get_ucm_group(self, name):
+        data = {'name': name}
+        axl_result = self.request('getCallManagerGroup', data)
+        return axl_result
 
-        # endregion
+    def update_ucm_group_members(self, name, members):
+        data = {'name': name, 'members': members}
+        axl_result = self.request('updateCallManagerGroup', data)
+        return axl_result
 
-        # region Call Routing
-        #AARGroup/application dial rules/sip Dial Rules/Router Filter/access list/time period/time schedule/Intercom/Client matter Codes/forced authorization codes/call park/call pickup group/meet Me/route plan report/
-        # RouteGroup
+    def add_ucm_group(self, name, members):
+        data = {'name': name, 'members': members}
+        axl_result = self.request('addCallManagerGroup', data)
+        return axl_result
 
-        # RouteList
+    def remove_ucm_group(self, name):
+        data = {'name': name}
+        axl_result = self.request('removeCallManagerGroup', data)
+        return axl_result
 
-        # RoutePattern
+    # endregion
 
-        # LineGroup
+    # region Users
 
-        # HuntList
+    def get_user(self, userid):
+        data = {'userid': userid}
+        axl_result = self.request('getUser', data)
+        return axl_result
 
-        # HuntPilot
+    def list_user(self, search_criteria_data, returned_tags=None):
+        returned_tags = {
+            "firstName": "",
+            "middleName": "",
+            "lastName": "",
+            "emMaxLoginTime": "",
+            "userid": "",
+            "mailid": "",
+            "department": "",
+            "manager": "",
+            "userLocale": "",
+            "primaryExtension": "",
+            "associatedPc": "",
+            "enableCti": "",
+            "subscribeCallingSearchSpaceName": "",
+            "enableMobility": "",
+            "enableMobileVoiceAccess": "",
+            "maxDeskPickupWaitTime": "",
+            "remoteDestinationLimit": "",
+            "status": "",
+            "enableEmcc": "",
+            "patternPrecedence": "",
+            "numericUserId": "",
+            "mlppPassword": "",
+            "homeCluster": "",
+            "imAndPresenceEnable": "",
+            "serviceProfile": "",
+            "directoryUri": "",
+            "telephoneNumber": "",
+            "title": "",
+            "mobileNumber": "",
+            "homeNumber": "",
+            "pagerNumber": "",
+            "calendarPresence": "",
+            "userIdentity": "",
+        }
+        data = {'searchCriteria': search_criteria_data, 'returnedTags': returned_tags}
+        axl_result = self.request('listUser', data)
+        return axl_result
 
-        # RoutePartition
-        class _RoutePartition: pass
-        self.RoutePartition = _RoutePartition
-        self.RoutePartition.Create = lambda data, serialize=False: self._callSoap_func('addRoutePartition', data, serialize)
-        self.RoutePartition.Get = lambda data, serialize=False: self._callSoap_func('getRoutePartition', data, serialize)
-        self.RoutePartition.List = lambda data, serialize=False: self._callSoap_func('listRoutePartition', data, serialize)
-        self.RoutePartition.Update = lambda data, serialize=False: self._callSoap_func('updateRoutePartition', data, serialize)
-        self.RoutePartition.Remove = lambda data, serialize=False: self._callSoap_func('removeRoutePartition', data, serialize)
-        # Css
-        class _Css: pass
-        self.Css = _Css
-        self.Css.Create = lambda data, serialize=False: self._callSoap_func('addCss', data, serialize)
-        self.Css.Get = lambda data, serialize=False: self._callSoap_func('getCss', data, serialize)
-        self.Css.List = lambda data, serialize=False: self._callSoap_func('listCss', data, serialize)
-        self.Css.Update = lambda data, serialize=False: self._callSoap_func('updateCss', data, serialize)
-        self.Css.Remove = lambda data, serialize=False: self._callSoap_func('removeCss', data, serialize)
-        # CmcInfo
+    def update_user(self, user_data):
+        axl_result = self.request('updateUser', user_data)
+        return axl_result
 
-        # FacInfo
+    # endregion
 
-        # TransPattern
+    # region SQL
 
-        # CallPark
+    def sql_get_device_pkid(self, device):
+        sql_query = f"select pkid from device where name = '{device}'"
+        axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
 
-        # CallPickupGroup
+    def sql_get_user_group_pkid(self, group_name):
+        sql_query = f"select pkid from dirgroup where name = '{group_name}'"
+        axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
 
-        # Line
-        class _Line: pass
-        self.Line = _Line
-        self.Line.Create = lambda data, serialize=False: self._callSoap_func('addLine', data, serialize)
-        self.Line.Get = lambda data, serialize=False: self._callSoap_func('getLine', data, serialize)
-        self.Line.List = lambda data, serialize=False: self._callSoap_func('listLine', data, serialize)
-        self.Line.Update = lambda data, serialize=False: self._callSoap_func('updateLine', data, serialize)
-        self.Line.Remove = lambda data, serialize=False: self._callSoap_func('removeLine', data, serialize)
-        # MeetMe
+    def sql_get_enduser_pkid(self, userid):
+        sql_query = f"select pkid from enduser where userid = '{userid}'"
+        axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
 
-        # RoutePlan
-        class _RoutePlan: pass
-        self.RoutePlan = _RoutePlan
-        self.RoutePlan.Get = lambda data, serialize=False: self._callSoap_func('getRoutePlan', data, serialize)
-        self.RoutePlan.List = lambda data, serialize=False: self._callSoap_func('listRoutePlan', data, serialize)
-        self.RoutePlan.Update = lambda data, serialize=False: self._callSoap_func('updateRoutePlan', data, serialize)
+    def sql_associate_user_to_group(self, userid, group_name):
+        user_group_pkid = self.sql_get_user_group_pkid(group_name)
+        enduser_pkid = self.sql_get_enduser_pkid(userid)
+        axl_result = {'success': False, 'message': '', 'response': ''}
+        if user_group_pkid is not None and enduser_pkid is not None:
+            sql_query = (
+                "insert into enduserdirgroupmap (fkenduser, fkdirgroup)"
+                f"values " "('{enduser_pkid}', '{user_group_pkid}')"
+            )
+            axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
 
-        # endregion
+    def sql_remove_user_from_group(self, userid, group_name):
+        pass
 
-        # region Media Resources
-        # Annunciator
+    def sql_query(self, sql_query):
+        axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
 
-        # ConferenceBridge
+    # region Lines
 
-        # Mtp
+    def get_line(self, dn, partition):
+        # getLine
+        data = {'dn': dn, 'partition': partition}
+        axl_result = self.request('getLine', data)
+        return axl_result
 
-        # MohAudioSource
+    def add_line(self, line_data):
+        # addLine
+        axl_result = self.request('addLine', line_data)
+        return axl_result
 
-        # MohServer
+    def update_line(self, line_data):
+        # updateLine
+        axl_result = self.request('updateLine', line_data)
+        return axl_result
 
-        # Transcoder
+    def apply_line(self, dn, partition=None):
+        # applyLine
+        data = {'dn': dn, 'partition': partition}
+        axl_result = self.request('applyLine', data)
+        return axl_result
 
-        # MediaResourceGroup
+    # endregion
 
-        # MediaResourceList
+    # region Partitions
 
-        # endregion
+    def add_partition(self, name, description):
+        # addRoutePartition
+        pass
 
-        # region Advanced Features
-        # VoiceMailPort
+    def get_partition(self, name, returned_tags=None):
+        # getRoutePartition
+        pass
 
-        # MessageWaiting
+    def remove_partition(self, name):
+        # removeRoutePartition
+        pass
 
-        # VoiceMailPilot
+    # endregion
 
-        # VoiceMailProfile
+    # region Calling Search Space
 
-        # endregion
+    def add_css(self, name, description, partition_list):
+        # addCss
+        pass
 
-        # region Device
-        # CtiRoutePoint
-        class _CtiRoutePoint: pass
-        self.CtiRoutePoint = _CtiRoutePoint
-        self.CtiRoutePoint.Create = lambda data, serialize=False: self._callSoap_func('addCtiRoutePoint', data, serialize)
-        self.CtiRoutePoint.Get = lambda data, serialize=False: self._callSoap_func('getCtiRoutePoint', data, serialize)
-        self.CtiRoutePoint.List = lambda data, serialize=False: self._callSoap_func('listCtiRoutePoint', data, serialize)
-        self.CtiRoutePoint.Update = lambda data, serialize=False: self._callSoap_func('updateCtiRoutePoint', data, serialize)
-        self.CtiRoutePoint.Remove = lambda data, serialize=False: self._callSoap_func('removeCtiRoutePoint', data, serialize)
-        # Phone
-        class _Phone: pass
-        self.Phone = _Phone
-        self.Phone.Create = lambda data, serialize=False: self._callSoap_func('addPhone', data, serialize)
-        self.Phone.Get = lambda data, serialize=False: self._callSoap_func('getPhone', data, serialize)
-        self.Phone.List = lambda data, serialize=False: self._callSoap_func('listPhone', data, serialize)
-        self.Phone.Update = lambda data, serialize=False: self._callSoap_func('updatePhone', data, serialize)
-        self.Phone.Remove = lambda data, serialize=False: self._callSoap_func('removePhone', data, serialize)
-        # SipTrunk
+    def get_css(self, name):
+        pass
 
-        # RemoteDestination
+    def remove_css(self, name):
+        pass
 
-        # DefaultDeviceProfile
+    def update_css(self, css_name, description, partition_list):
+        pass
 
-        # DeviceProfile
-        class _DeviceProfile: pass
-        self.DeviceProfile = _DeviceProfile
-        self.DeviceProfile.Create = lambda data, serialize=False: self._callSoap_func('addDeviceProfile', data, serialize)
-        self.DeviceProfile.Get = lambda data, serialize=False: self._callSoap_func('getDeviceProfile', data, serialize)
-        self.DeviceProfile.List = lambda data, serialize=False: self._callSoap_func('listDeviceProfile', data, serialize)
-        self.DeviceProfile.Update = lambda data, serialize=False: self._callSoap_func('updateDeviceProfile', data, serialize)
-        self.DeviceProfile.Remove = lambda data, serialize=False: self._callSoap_func('removeDeviceProfile', data, serialize)
-        # PhoneButtonTemplate
+    # endregion
 
-        # SoftKeyTemplate
+    # region Route Group
 
-        # IpPhoneServices
+    def add_route_group(self, name, distribution_algorithm, device_list):
+        # addRouteGroup
+        pass
 
-        # SipProfile
+    def get_route_group(self, name):
+        pass
 
-        # CommonDeviceConfig
+    def remove_route_group(self, name):
+        pass
 
-        # CommonPhoneConfig
+    def update_route_group(self, name):
+        pass
 
-        # RemoteDestinationProfile
+    # endregion
 
-        # endregion
+    # region Route List
 
-        # region User Management
-        # AppUser
+    def add_route_list(self, name, description, cm_group, enabled, roan, members, ddi=None):
+        # addRouteList
+        pass
 
-        # User
-        class _User: pass
-        self.User = _User
-        self.User.Create = lambda data, serialize=False: self._callSoap_func('addUser', data, serialize)
-        self.User.Get = lambda data, serialize=False: self._callSoap_func('getUser', data, serialize)
-        self.User.List = lambda data, serialize=False: self._callSoap_func('listUser', data, serialize)
-        self.User.Update = lambda data, serialize=False: self._callSoap_func('updateUser', data, serialize)
-        self.User.Remove = lambda data, serialize=False: self._callSoap_func('removeUser', data, serialize)
-        # UserGroup
-        class _UserGroup: pass
-        self.UserGroup = _UserGroup
-        self.UserGroup.Create = lambda data, serialize=False: self._callSoap_func('addUserGroup', data, serialize)
-        self.UserGroup.Get = lambda data, serialize=False: self._callSoap_func('getUserGroup', data, serialize)
-        self.UserGroup.List = lambda data, serialize=False: self._callSoap_func('listUserGroup', data, serialize)
-        self.UserGroup.Update = lambda data, serialize=False: self._callSoap_func('updateUserGroup', data, serialize)
-        self.UserGroup.Remove = lambda data, serialize=False: self._callSoap_func('removeUserGroup', data, serialize)
-        # UserPhoneAssociation
-        class _UserPhoneAssociation: pass
-        self.UserPhoneAssociation = _UserPhoneAssociation
-        self.UserPhoneAssociation.Create = lambda data, serialize=False: self._callSoap_func('addUserPhoneAssociation', data, serialize)
-        # UcService
+    def get_route_list(self, name):
+        pass
 
-        # ServiceProfile
+    def remove_route_list(self, name):
+        pass
 
-        # endregion
+    # endregion
 
-        # region Thin AXL (SQL Queries / Updates)
-        class _Sql: pass
-        self.Sql = _Sql
-        self.Sql.Query = lambda data, serialize=False: self._callSoap_func('executeSQLQuery', data, serialize)
-        # endregion
-    def _callSoap_func(self, func_name, data, serialize=False):
-        try:
-            result = getattr(self.service, func_name)(**data)
-            #result = self.service.updateAppUser(**data)
-        except Exception as fault:
-            result = None
-            self.last_exception = fault
-        if result is not None: result = result['return']
-        if serialize is True:
-            return serialize_object(result)
+    # region Route Pattern
+
+    def add_route_pattern(self, pattern, partition, route_list, network_location, outside_dialtone):
+        # addRoutePattern
+        pass
+
+    def get_route_pattern(self, pattern, partition):
+        pass
+
+    def remove_route_pattern(self, pattern, partition):
+        pass
+
+    def update_route_pattern(self, name):
+        pass
+
+    # endregion
+
+    # region Translation Pattern
+
+    def add_translation_pattern(self, pattern, partition, route_list, network_location, outside_dialtone):
+        # addRoutePattern
+        pass
+
+    def get_translation_pattern(self, pattern, partition):
+        pass
+
+    def remove_translation_pattern(self, pattern, partition):
+        pass
+
+    def update_translation_pattern(self, name):
+        pass
+
+    # endregion
+
+    # region Device Pool
+
+    def get_device_pool(self, name):
+        # getDevicePool
+        pass
+
+    # endregion
+
+    # region Device Security Profile
+
+    def get_phone_security_profile(self, name):
+        pass
+
+    # endregion
+
+    # region SIP Trunk Security Profile
+
+    def get_sip_trunk_security_profile(self, name):
+        pass
+
+    # endregion
+
+    # region Reset / Restart Devices
+
+    def do_reset_restart_device(self, device, is_hard_reset, is_mgcp):
+        reset_data = {'deviceName': device, 'isHardReset': is_hard_reset, 'isMGCP': is_mgcp}
+        axl_result = self.request('doDeviceReset', reset_data)
+        return axl_result
+
+    def reset_device(self, device):
+        result = self.do_reset_restart_device(device, True, False)
         return result
 
+    def restart_device(self, device):
+        result = self.do_reset_restart_device(device, False, False)
+        return result
+
+    def reset_mgcp(self, device):
+        result = self.do_reset_restart_device(device, True, True)
+        return result
+
+    def restart_mgcp(self, device):
+        result = self.do_reset_restart_device(device, False, True)
+        return result
+
+    # endregion
+
+    # region Service Parameters
+
+    def sql_update_service_parameter(self, name, value):
+        pass
+        # query = "update processconfig set paramvalue = '{0}' where paramname = '{1}'".format(value, name)
+        # axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        # return axl_result
+
+    def sql_get_service_parameter(self, name):
+        sql_query = f"select * from processconfig where paramname = '{name}'"
+        axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
+
+    # endregion
+
+    #  region Device Association
+    def sql_associate_device_to_user(self, device, userid, association_type='1'):
+        device_pkid = self.sql_get_device_pkid(device)
+        enduser_pkid = self.sql_get_enduser_pkid(userid)
+        axl_result = {'success': False, 'message': '', 'response': ''}
+        if device_pkid is not None and enduser_pkid is not None:
+            sql_query = (
+                f"insert into enduserdevicemap (fkenduser, fkdevice, defaultprofile, tkuserassociation) "
+                f"values ('{enduser_pkid}','{device_pkid}','f','{association_type}')"
+            )
+            axl_result = self.request('executeSQLQuery', {'sql': sql_query})
+        return axl_result
+
+    # endregion
